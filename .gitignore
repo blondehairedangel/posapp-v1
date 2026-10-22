@@ -25,6 +25,10 @@ next-env.d.ts
 # generated prisma client
 /src/generated/
 
+# Local editor/agent settings. Shared steering and hooks under .kiro/ are
+# intentionally NOT ignored — only machine-local settings are.
+/.kiro/settings/
+
 # misc
 .DS_Store
 *.pem
