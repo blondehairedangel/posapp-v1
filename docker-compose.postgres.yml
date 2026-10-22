@@ -1,0 +1,66 @@
+# =============================================================================
+# Optional bundled PostgreSQL.
+#
+# Overlay this on the base file only if you do NOT already run PostgreSQL:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#     up -d --build
+#
+# When using it, DATABASE_URL in .env must point at this service by name:
+#
+#   POSTGRES_PASSWORD=<strong-password>
+#   DATABASE_URL=postgresql://erp:<same-password>@postgres:5432/sparepart_erp?schema=public
+#
+# The password appears twice on purpose: once to initialise the server, once
+# for the application to log in. They must match. Keeping DATABASE_URL
+# authoritative is what lets the base file work against any database.
+# =============================================================================
+
+name: sparepart-erp
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-erp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required when using the bundled database}
+      POSTGRES_DB: ${POSTGRES_DB:-sparepart_erp}
+      # Deterministic collation so index ordering cannot shift under us.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --lc-collate=C --lc-ctype=C'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Deliberately NOT published: the database is reachable only on the
+    # internal network. Uncomment only for local debugging, bound to
+    # localhost, never 0.0.0.0.
+    # ports:
+    #   - '127.0.0.1:5432:5432'
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-erp} -d ${POSTGRES_DB:-sparepart_erp}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [internal]
+
+  # Compose merges these into the base definitions, so migrations wait for the
+  # database to be healthy before they run.
+  migrate:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+    driver: local

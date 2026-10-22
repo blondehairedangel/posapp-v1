@@ -25,8 +25,8 @@ Then set, at minimum:
 | Variable | Notes |
 | --- | --- |
 | `APP_URL` | Public HTTPS origin. Used to build the WhatsApp callback URL and links in outbound email. |
-| `POSTGRES_PASSWORD` | Compose refuses to start without it. |
-| `DATABASE_URL` | Compose overrides this per service to point at `postgres`. Only set it yourself if you use an external database. |
+| `DATABASE_URL` | **The only place the database and its password are set.** No compose file overrides it. See §2.1. |
+| `POSTGRES_PASSWORD` | Only needed if you use the bundled database overlay. Must match the password inside `DATABASE_URL`. |
 | `SESSION_SECRET` | Signs session cookies. Rotating it logs everyone out. |
 | `APP_ENCRYPTION_KEY` | AES-256-GCM key for secrets stored in the database. **Rotating it makes every stored channel token and mailbox password undecryptable.** Back it up. |
 | `APP_TIMEZONE` | Display timezone. Storage is always UTC. |
@@ -34,13 +34,80 @@ Then set, at minimum:
 `APP_ENCRYPTION_KEY` must decode to exactly 32 bytes; the app refuses to boot
 otherwise rather than failing later on first decrypt.
 
+### 2.1 Pointing at your own PostgreSQL
+
+`docker-compose.yml` contains **no database**. The application does not own
+its PostgreSQL instance, and no compose file sets `DATABASE_URL` — it comes
+from `.env` only, so there is nothing to silently override your value.
+
+```
+postgresql://USER:PASSWORD@HOST:PORT/DATABASE?schema=public
+```
+
+Choose `HOST` by where PostgreSQL actually runs:
+
+| Your setup | `HOST` | Extra step |
+| --- | --- | --- |
+| PostgreSQL in **another compose stack** | its service name, e.g. `postgres` | share its network — below |
+| PostgreSQL **on the Docker host** | `host.docker.internal` | on Linux add `extra_hosts: ['host.docker.internal:host-gateway']` to `migrate`, `web`, `worker` |
+| **Managed/remote** (RDS, Neon, Supabase) | the provider hostname | usually `?sslmode=require` |
+| The **bundled** overlay | `postgres` | see §3 |
+
+To reach a database in another compose project, find its network and attach
+to it:
+
+```bash
+docker network ls                       # e.g. my-postgres-stack_default
+```
+
+```yaml
+# docker-compose.yml
+networks:
+  dbnet:
+    external: true
+    name: my-postgres-stack_default
+```
+
+Then add `dbnet` to the `networks:` list of `migrate`, `web` and `worker`.
+A commented template is already in the file.
+
+**Password encoding.** If the password contains `@ : / ? # %`, percent-encode
+it (`@`→`%40`, `:`→`%3A`, `/`→`%2F`, `?`→`%3F`, `#`→`%23`, `%`→`%25`).
+Otherwise the URL parser misreads where the host begins.
+
+**Required privileges.** The user needs `CREATE TABLE` in the target database
+**and `CREATE SCHEMA`** — the job queue (pg-boss) creates and owns a separate
+`pgboss` schema there. Being the database owner is sufficient. A user
+restricted to `public` will fail when the worker starts, not at migration
+time, so grant it up front:
+
+```sql
+CREATE DATABASE sparepart_erp OWNER erp;
+```
+
 ## 3. Start
+
+Against your own PostgreSQL:
 
 ```bash
 docker compose up -d --build
 ```
 
-Order is enforced by Compose: `postgres` becomes healthy → `migrate` runs
+Or, if you do **not** already run PostgreSQL, overlay the bundled one:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+  up -d --build
+```
+
+With the overlay, set both of these in `.env`, with matching passwords:
+
+```bash
+POSTGRES_PASSWORD=some-strong-password
+DATABASE_URL=postgresql://erp:some-strong-password@postgres:5432/sparepart_erp?schema=public
+```
+
+Order is enforced by Compose: (`postgres` healthy, when used) → `migrate` runs
 `prisma migrate deploy` and exits 0 → `web` and `worker` start. Running
 migrations as a one-shot service means two web replicas can never race to
 apply the same migration.
