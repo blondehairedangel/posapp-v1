@@ -35,10 +35,15 @@ const config = [
     },
   },
   {
-    // CLI entry points: stdout IS the user interface here, so console is the
-    // correct tool and the structured logger would be the wrong one.
-    files: ['scripts/**/*.{js,mjs,ts}', 'prisma/seed.mts'],
-    rules: { 'no-console': 'off' },
+    // CLI entry points. stdout IS the user interface here, so console is the
+    // right tool and the structured logger would be the wrong one; and the
+    // `check ? pass() : fail()` assertion style used by the smoke scripts is
+    // deliberate rather than a stray expression.
+    files: ['scripts/**', 'prisma/seed.mts'],
+    rules: {
+      'no-console': 'off',
+      '@typescript-eslint/no-unused-expressions': 'off',
+    },
   },
 ];
 
