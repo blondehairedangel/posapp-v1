@@ -24,12 +24,14 @@
     "prisma:deploy": "prisma migrate deploy",
     "seed": "tsx prisma/seed.mts",
     "db:start": "bash scripts/dev-postgres.sh start",
-    "db:stop": "bash scripts/dev-postgres.sh stop"
+    "db:stop": "bash scripts/dev-postgres.sh stop",
+    "prisma:reset": "tsx scripts/db-guard.mts \"prisma migrate reset (DROPS ALL DATA)\" -- pnpm exec prisma migrate reset --force",
+    "db:target": "tsx scripts/db-target.mts",
+    "db:wait": "tsx scripts/wait-for-db.mts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.mts"
   },
-
   "dependencies": {
     "@hookform/resolvers": "6.0.0",
     "@prisma/adapter-pg": "7.10.1",

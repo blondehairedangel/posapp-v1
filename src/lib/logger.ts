@@ -28,6 +28,17 @@ export const logger = pino({
       'AI_API_KEY',
       'SESSION_SECRET',
       'APP_ENCRYPTION_KEY',
+      // A connection string carries the database password. Log
+      // `databaseTargetSummary()` or `config.safeUrl` instead.
+      'DATABASE_URL',
+      'databaseUrl',
+      'connectionString',
+      '*.connectionString',
+      'DB_PASSWORD',
+      'dbPassword',
+      // Deliberately NOT redacting a bare `url` key: webhook callbacks and
+      // APP_URL are logged legitimately and over-redaction makes incident
+      // diagnosis harder. Connection strings are covered by the keys above.
     ],
     censor: '[redacted]',
   },

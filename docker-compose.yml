@@ -44,6 +44,13 @@ services:
       JOB_WORKER_ENABLED: 'false'
     volumes:
       - attachments:/app/storage
+      # TLS to a remote database (DB_SSLMODE=verify-ca / verify-full):
+      # mount the CA bundle read-only and point DB_SSL_ROOT_CERT at it.
+      # - ./certs/pg-ca.crt:/etc/ssl/certs/pg-ca.crt:ro
+    # PostgreSQL installed on the Docker HOST rather than in a container.
+    # Docker Desktop resolves host.docker.internal already; Linux needs this:
+    # extra_hosts:
+    #   - 'host.docker.internal:host-gateway'
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -74,6 +81,9 @@ services:
       # Shares attachment storage with web so inbound email attachments are
       # readable by the UI.
       - attachments:/app/storage
+      # - ./certs/pg-ca.crt:/etc/ssl/certs/pg-ca.crt:ro
+    # extra_hosts:
+    #   - 'host.docker.internal:host-gateway'
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -96,16 +106,21 @@ networks:
   web:
     driver: bridge
   # ---------------------------------------------------------------------------
-  # Reaching a PostgreSQL that lives in ANOTHER compose project
+  # Scenario B — PostgreSQL in ANOTHER Compose project on the same host
   # ---------------------------------------------------------------------------
-  # If your database runs in a separate stack, the app containers must share a
-  # network with it. Find the network name with `docker network ls`, then
-  # declare it here as external and add it to the `migrate`, `web` and
-  # `worker` service network lists:
+  # Separate Compose projects get separate networks, so the hostnames
+  # `postgres`, `db` and `localhost` are NOT reachable across them by default.
+  # The app must join the database's network explicitly.
+  #
+  #   docker network ls                      # find it, e.g. dbstack_default
+  #
+  # Then uncomment below, and add `dbnet` to the `networks:` list of the
+  # migrate, web and worker services:
   #
   #   dbnet:
   #     external: true
-  #     name: my-postgres-stack_default
+  #     name: dbstack_default
   #
-  # With that in place, use the database's SERVICE name as the host in
-  # DATABASE_URL (for example `postgres` or `db`), not localhost.
+  # Only then does DB_HOST=<database service name> resolve. Full walkthrough,
+  # including the reverse (exposing your DB stack on a shared network):
+  # docs/DATABASE.md §Scenario B.

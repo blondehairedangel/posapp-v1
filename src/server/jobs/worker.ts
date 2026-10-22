@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { env } from '@/lib/env';
 import { log } from '@/lib/logger';
-import { prisma } from '@/lib/db';
+import { databaseTargetSummary, prisma, waitForDatabase } from '@/lib/db';
 import { pruneExpiredSessions } from '@/server/auth/session';
 import { dispatchOutboundMessage } from '@/server/channels/dispatch';
 import { pollMailbox } from '@/server/channels/imap';
@@ -41,6 +41,25 @@ async function main() {
     logger.warn('JOB_WORKER_ENABLED is false — worker will idle and exit');
     return;
   }
+
+  // The worker needs the database at boot (pg-boss creates/claims its schema),
+  // unlike the web server which connects lazily. An external PostgreSQL —
+  // another Compose project, or another host — has no `depends_on` health gate,
+  // so wait for it rather than crash-looping.
+  logger.info({ target: databaseTargetSummary() }, 'waiting for database');
+  const ready = await waitForDatabase({
+    timeoutMs: 120_000,
+    onAttempt: (attempt, error) =>
+      logger.warn({ attempt, error }, 'database not ready yet; retrying'),
+  });
+  if (!ready.ok) {
+    logger.fatal(
+      { attempts: ready.attempts, error: ready.error, target: databaseTargetSummary() },
+      'database unreachable; worker cannot start',
+    );
+    process.exit(1);
+  }
+  logger.info({ attempts: ready.attempts }, 'database ready');
 
   const boss = await getQueue();
 

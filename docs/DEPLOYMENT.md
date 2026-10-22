@@ -36,6 +36,22 @@ otherwise rather than failing later on first decrypt.
 
 ### 2.1 Pointing at your own PostgreSQL
 
+> Full reference — precedence rules, all `DB_*` variables, separate-VPS setup
+> with `pg_hba.conf`/firewall/TLS, pooling and migration safety — is in
+> **[`docs/DATABASE.md`](DATABASE.md)**. The summary below covers the common
+> cases.
+
+Settings come from environment variables only; nothing is hardcoded. Either
+supply a single `DATABASE_URL`, **or** the individual parts (`DB_HOST`,
+`DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`). `DATABASE_URL` wins when both
+are present, and the `DB_*` values are then ignored entirely.
+
+Confirm what will actually be used — the password is redacted:
+
+```bash
+pnpm db:target
+```
+
 `docker-compose.yml` contains **no database**. The application does not own
 its PostgreSQL instance, and no compose file sets `DATABASE_URL` — it comes
 from `.env` only, so there is nothing to silently override your value.

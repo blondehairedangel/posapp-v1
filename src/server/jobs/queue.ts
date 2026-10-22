@@ -1,5 +1,6 @@
 import { PgBoss } from 'pg-boss';
 import type { Job } from 'pg-boss';
+import { buildPoolConfig, databaseConfig } from '@/lib/db-config';
 import { env } from '@/lib/env';
 import { log } from '@/lib/logger';
 
@@ -81,9 +82,17 @@ export async function getQueue(): Promise<PgBoss> {
   if (starting) return starting;
 
   starting = (async () => {
+    // pg-boss owns its own schema in the same database, so it resolves the
+    // target through the shared config rather than reading the environment
+    // itself. It needs CREATE SCHEMA on first start.
+    const config = databaseConfig();
     const instance = new PgBoss({
-      connectionString: env().DATABASE_URL,
+      connectionString: config.url,
       schema: env().JOB_SCHEMA,
+      max: Math.max(2, Math.ceil(config.poolMax / 2)),
+      ...(config.sslMode && config.sslMode !== 'disable'
+        ? { ssl: buildPoolConfig(config).ssl }
+        : {}),
     });
 
     instance.on('error', (error: unknown) => {

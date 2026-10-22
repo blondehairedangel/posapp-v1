@@ -1,10 +1,18 @@
 import 'dotenv/config';
-import { defineConfig, env } from 'prisma/config';
+import { defineConfig } from 'prisma/config';
+import { resolveDatabaseConfig } from './src/lib/db-config.ts';
 
 /**
- * Prisma 7 moved the datasource URL out of schema.prisma. This file is used by
- * the Prisma CLI (migrate / db / studio); the application runtime supplies the
- * same URL to PrismaClient through the pg driver adapter in src/lib/db.ts.
+ * Prisma CLI configuration (migrate / db / studio).
+ *
+ * The URL is resolved through the same module the application uses, so
+ * `prisma migrate deploy` and the running app can never disagree about which
+ * database they mean — including when the target is supplied as DB_HOST,
+ * DB_PORT, DB_NAME, DB_USER, DB_PASSWORD rather than DATABASE_URL.
+ *
+ * Resolution is lazy (inside the getter) so that commands which do not touch
+ * a database, such as `prisma generate` and `prisma validate`, still work in
+ * an environment with no database configured — a Docker build, for instance.
  */
 export default defineConfig({
   schema: 'prisma/schema.prisma',
@@ -13,6 +21,8 @@ export default defineConfig({
     seed: 'tsx prisma/seed.mts',
   },
   datasource: {
-    url: env('DATABASE_URL'),
+    get url() {
+      return resolveDatabaseConfig().url;
+    },
   },
 });
