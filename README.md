@@ -86,6 +86,28 @@ Tests run against a **real** PostgreSQL instance. Mocked database responses
 would prove nothing about the transactional stock invariants they exist to
 check.
 
+## Database configuration
+
+The application does not own its PostgreSQL instance. Point it anywhere with
+environment variables — a container, another Compose project, another VPS, or
+a managed service — with no code change:
+
+```bash
+DATABASE_URL=postgresql://user:password@host:5432/sparepart_erp?schema=public
+# or, equivalently (no manual escaping needed):
+DB_HOST=... DB_PORT=5432 DB_NAME=... DB_USER=... DB_PASSWORD=...
+```
+
+`DATABASE_URL` wins when both forms are set. There is no localhost fallback —
+an unconfigured app refuses to start rather than quietly using the wrong
+database. Check the resolved target any time with `pnpm db:target` (credentials
+are redacted).
+
+See **[`docs/DATABASE.md`](docs/DATABASE.md)** for the three deployment
+scenarios, TLS/`pg_hba.conf`/firewall setup for a separate VPS, connection
+pooling, and the guard that stops destructive migrations hitting the wrong
+database.
+
 ## Deployment
 
 ```bash

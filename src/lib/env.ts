@@ -52,7 +52,22 @@ const schema = z.object({
   APP_CURRENCY: z.string().length(3).default('IDR'),
   APP_LOCALE: z.string().default('id-ID'),
 
-  DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+  // Database configuration is validated by ./db-config, which owns the
+  // DATABASE_URL-vs-DB_* precedence and must stay usable by the Prisma CLI
+  // without the app secrets below. These are declared only so an unknown-key
+  // typo is still visible; none of them is required here.
+  DATABASE_URL: z.string().optional(),
+  DB_HOST: z.string().optional(),
+  DB_PORT: z.string().optional(),
+  DB_NAME: z.string().optional(),
+  DB_USER: z.string().optional(),
+  DB_PASSWORD: z.string().optional(),
+  DB_SCHEMA: z.string().optional(),
+  DB_SSLMODE: z.string().optional(),
+  DB_SSL_ROOT_CERT: z.string().optional(),
+  DB_POOL_MAX: z.string().optional(),
+  DB_CONNECT_TIMEOUT_MS: z.string().optional(),
+  DB_IDLE_TIMEOUT_MS: z.string().optional(),
 
   SESSION_SECRET: z
     .string()

@@ -1,45 +1,23 @@
 # =============================================================================
-# Automotive Spare Parts ERP — Docker Compose
+# Automotive Spare Parts ERP — application services
 #
+# This file deliberately does NOT contain a database. The application does not
+# own its PostgreSQL instance: point DATABASE_URL at whatever you already run.
+#
+#   # Against your own PostgreSQL (set DATABASE_URL in .env):
 #   docker compose up -d --build
 #
-# Services:
-#   postgres   PostgreSQL 17 with a named volume (NOT published to the host)
-#   migrate    runs `prisma migrate deploy`, then exits
-#   web        Next.js server
-#   worker     pg-boss background worker (IMAP polling, dispatch, retries)
+#   # Or bring up a bundled PostgreSQL too, for evaluation:
+#   docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
+#     up -d --build
 #
-# All secrets come from .env. Copy .env.example and fill it in first.
+# DATABASE_URL is read from .env and is NOT overridden here, so .env is the
+# single source of truth for the connection string.
 # =============================================================================
 
 name: sparepart-erp
 
 services:
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-erp}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      POSTGRES_DB: ${POSTGRES_DB:-sparepart_erp}
-      # Deterministic collation so index ordering cannot shift under us.
-      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --lc-collate=C --lc-ctype=C'
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    # Deliberately NOT published: the database is reachable only on the
-    # internal network. Uncomment only for local debugging, bound to
-    # localhost, never 0.0.0.0.
-    # ports:
-    #   - '127.0.0.1:5432:5432'
-    healthcheck:
-      test:
-        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-erp} -d ${POSTGRES_DB:-sparepart_erp}']
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-    networks: [internal]
-
   # Runs migrations to completion before web/worker start, so two replicas
   # never race to apply the same migration.
   migrate:
@@ -50,11 +28,6 @@ services:
       target: migrator
     restart: 'no'
     env_file: [.env]
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
-    depends_on:
-      postgres:
-        condition: service_healthy
     networks: [internal]
 
   web:
@@ -66,15 +39,19 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
-      # The worker runs as its own service, so the web replicas must not also
+      # The worker runs as its own service, so web replicas must not also
       # claim jobs.
       JOB_WORKER_ENABLED: 'false'
     volumes:
       - attachments:/app/storage
+      # TLS to a remote database (DB_SSLMODE=verify-ca / verify-full):
+      # mount the CA bundle read-only and point DB_SSL_ROOT_CERT at it.
+      # - ./certs/pg-ca.crt:/etc/ssl/certs/pg-ca.crt:ro
+    # PostgreSQL installed on the Docker HOST rather than in a container.
+    # Docker Desktop resolves host.docker.internal already; Linux needs this:
+    # extra_hosts:
+    #   - 'host.docker.internal:host-gateway'
     depends_on:
-      postgres:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     # Behind a reverse proxy (Coolify/Traefik/Caddy) this port need not be
@@ -99,36 +76,51 @@ services:
     env_file: [.env]
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
       JOB_WORKER_ENABLED: 'true'
     volumes:
       # Shares attachment storage with web so inbound email attachments are
       # readable by the UI.
       - attachments:/app/storage
+      # - ./certs/pg-ca.crt:/etc/ssl/certs/pg-ca.crt:ro
+    # extra_hosts:
+    #   - 'host.docker.internal:host-gateway'
     depends_on:
-      postgres:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      # The worker exposes no port; liveness is "the process is up and can
-      # reach the database".
-      test: ['CMD', 'node', '-e', "process.exit(0)"]
+      # The worker exposes no port; liveness is "the process is up".
+      test: ['CMD', 'node', '-e', 'process.exit(0)']
       interval: 60s
       timeout: 5s
       retries: 3
     networks: [internal]
 
 volumes:
-  postgres-data:
-    driver: local
   attachments:
     driver: local
 
 networks:
-  # No external access: postgres and the worker live here only.
   internal:
     driver: bridge
   # Reverse proxies attach here to reach `web`.
   web:
     driver: bridge
+  # ---------------------------------------------------------------------------
+  # Scenario B — PostgreSQL in ANOTHER Compose project on the same host
+  # ---------------------------------------------------------------------------
+  # Separate Compose projects get separate networks, so the hostnames
+  # `postgres`, `db` and `localhost` are NOT reachable across them by default.
+  # The app must join the database's network explicitly.
+  #
+  #   docker network ls                      # find it, e.g. dbstack_default
+  #
+  # Then uncomment below, and add `dbnet` to the `networks:` list of the
+  # migrate, web and worker services:
+  #
+  #   dbnet:
+  #     external: true
+  #     name: dbstack_default
+  #
+  # Only then does DB_HOST=<database service name> resolve. Full walkthrough,
+  # including the reverse (exposing your DB stack on a shared network):
+  # docs/DATABASE.md §Scenario B.

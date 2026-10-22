@@ -44,16 +44,23 @@ FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# `prisma generate` and the Next build need syntactically valid configuration,
-# but never connect to a database. Real values are injected at runtime.
-ENV DATABASE_URL="postgresql://build:build@localhost:5432/build?schema=public"
-ENV SESSION_SECRET="build-time-placeholder-value-not-used-at-runtime"
-ENV APP_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 
+# No database configuration is baked into the image — not even a placeholder.
+# `prisma generate` resolves its datasource lazily (see prisma.config.ts), so
+# it does not need one; the build therefore cannot embed a connection string
+# in an image layer, and cannot accidentally reach a real database.
 RUN pnpm prisma generate
-RUN pnpm next build
+
+# The Next build imports modules that validate configuration at import time.
+# These two placeholders exist only for that duration: they are passed to the
+# single RUN command rather than declared with ENV, so they never become part
+# of an image layer or show up in `docker history`. Real values are supplied
+# at runtime.
+RUN SESSION_SECRET="build-only-not-a-credential-0000000000000000" \
+    APP_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" \
+    pnpm next build
 
 # The worker is NOT bundled. The Prisma 7 `prisma-client` generator emits
 # TypeScript that reads `import.meta.url` to locate its query engine; bundling
@@ -67,10 +74,18 @@ RUN pnpm next build
 FROM base AS migrator
 ENV NODE_ENV=production
 COPY --from=deps /app/node_modules ./node_modules
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml prisma.config.ts ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml prisma.config.ts tsconfig.json ./
 COPY prisma ./prisma
-COPY --from=builder /app/src/generated ./src/generated
-CMD ["node_modules/.bin/prisma", "migrate", "deploy"]
+COPY scripts ./scripts
+# prisma.config.ts resolves the datasource through src/lib/db-config.ts, so
+# the migrator needs that module (and tsconfig for the "@/*" alias).
+COPY --from=builder /app/src ./src
+
+# Wait for the database before migrating. `depends_on` cannot express a health
+# condition for a database in a different Compose project or on another host,
+# so the migration step waits here instead of failing and restarting.
+# `migrate deploy` is forward-only and never resets.
+CMD ["sh", "-c", "node_modules/.bin/tsx scripts/wait-for-db.mts 120 && node_modules/.bin/prisma migrate deploy"]
 
 # --------------------------------------------------------------- runner -------
 FROM base AS runner

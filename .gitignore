@@ -11,10 +11,15 @@ next-env.d.ts
 /build
 /dist
 
-# secrets - never commit a real environment file
+# Secrets — never commit a real environment file.
+#
+# Rule order matters: deny every .env variant, then re-allow the committed
+# TEMPLATES. The negation pattern is `*.example` rather than a list, so a new
+# template (.env.staging.example) is tracked automatically while the real
+# .env.staging stays ignored.
 .env
 .env.*
-!.env.example
+!.env*.example
 
 # local development postgres cluster + downloaded binaries
 /.devdata/
