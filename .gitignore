@@ -1,0 +1,38 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+
+# production
+/build
+/dist
+
+# secrets - never commit a real environment file
+.env
+.env.*
+!.env.example
+
+# local development postgres cluster + downloaded binaries
+/.devdata/
+
+# locally stored attachments (STORAGE_DRIVER=local)
+/storage/
+
+# generated prisma client
+/src/generated/
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vercel
+*.tsbuildinfo
+
+# test output
+/coverage/

@@ -1,0 +1,21 @@
+# pnpm >= 11 reads these settings here, not from package.json or .npmrc.
+#
+# `allowBuilds` replaced the old onlyBuiltDependencies / neverBuiltDependencies
+# / ignoredBuiltDependencies trio with a single { name: true | false } map.
+# Every dependency that wants to run a lifecycle script must be listed
+# explicitly, so a new postinstall introduced by a transitive upgrade fails the
+# install instead of executing silently.
+allowBuilds:
+  # Fetches/validates the query + migration engine binaries.
+  '@prisma/engines': true
+  prisma: true
+  # Platform binary for esbuild (used by Vitest and tsx).
+  esbuild: true
+  # Native resolver binding used by the Next.js ESLint config.
+  unrs-resolver: true
+
+# pnpm refuses packages published within `minimumReleaseAge` as a
+# supply-chain guard. imapflow is excluded deliberately; the rest of the
+# dependency set is pinned to releases old enough to satisfy the default policy.
+minimumReleaseAgeExclude:
+  - imapflow@2.8.0

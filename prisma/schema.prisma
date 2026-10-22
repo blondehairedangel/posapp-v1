@@ -1,0 +1,2390 @@
+// ===========================================================================
+// Automotive Spare Parts ERP + Customer Order Ticketing
+// ---------------------------------------------------------------------------
+// Conventions (see docs/ARCHITECTURE.md §6, §7, §8):
+//   * Money      -> Decimal(18, 4)   never Float
+//   * Quantity   -> Decimal(18, 3)   never Float
+//   * Timestamps -> timestamptz, always stored UTC
+//   * StockMovement is the append-only ledger of record; InventoryBalance is a
+//     derived cache that must only ever be written inside the same transaction
+//     as its movement row.
+// ===========================================================================
+
+// Prisma 7: the connection URL lives in prisma.config.ts (for Migrate) and is
+// supplied to PrismaClient through a driver adapter at runtime. It is
+// deliberately absent from this file.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================== ENUMS =====================================
+
+enum CustomerType {
+  INDIVIDUAL
+  BUSINESS
+  WORKSHOP
+  FLEET
+  RESELLER
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED
+  ARCHIVED
+}
+
+enum AddressKind {
+  BILLING
+  SHIPPING
+}
+
+enum ChannelType {
+  WHATSAPP
+  EMAIL
+  MANUAL
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+/// Controls whether a ticket message is ever delivered to, or rendered for,
+/// a customer. INTERNAL messages are internal notes and must never leave the
+/// application (enforced in the ticket service + regression-tested).
+enum MessageVisibility {
+  PUBLIC
+  INTERNAL
+}
+
+enum DeliveryStatus {
+  PENDING
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum TicketStatus {
+  NEW
+  OPEN
+  IN_PROGRESS
+  AWAITING_CUSTOMER
+  AWAITING_INTERNAL
+  ORDER_PENDING_CONFIRMATION
+  CONVERTED_TO_SALES_ORDER
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+  CONVERTED
+}
+
+enum SalesOrderStatus {
+  DRAFT
+  CONFIRMED
+  PARTIALLY_FULFILLED
+  FULFILLED
+  INVOICED
+  COMPLETED
+  CANCELLED
+}
+
+enum FulfillmentStatus {
+  PENDING
+  PICKING
+  PACKED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+  CREDITED
+}
+
+enum PurchaseRequestStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+  CONVERTED
+  CANCELLED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SUBMITTED
+  CONFIRMED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum PaymentDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CHEQUE
+  CARD
+  CREDIT_NOTE
+  OTHER
+}
+
+/// Reason a stock ledger row exists. Drives inventory valuation reporting and
+/// makes every balance change attributable to a business document.
+enum StockMovementType {
+  GOODS_RECEIPT
+  SALES_SHIPMENT
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  TRANSFER_IN
+  TRANSFER_OUT
+  SALES_RETURN_IN
+  PURCHASE_RETURN_OUT
+  STOCKTAKE_CORRECTION
+  OPENING_BALANCE
+}
+
+enum ReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED
+}
+
+enum StockAdjustmentStatus {
+  DRAFT
+  POSTED
+  CANCELLED
+}
+
+enum StocktakeStatus {
+  DRAFT
+  COUNTING
+  POSTED
+  CANCELLED
+}
+
+enum TransferStatus {
+  DRAFT
+  IN_TRANSIT
+  COMPLETED
+  CANCELLED
+}
+
+/// Lifecycle of an AI/deterministic extraction result. A draft is inert until
+/// a human approves it: it reserves no stock and creates no order.
+enum ExtractionStatus {
+  PENDING_REVIEW
+  IN_REVIEW
+  APPROVED
+  REJECTED
+  CONVERTED
+  FAILED
+}
+
+enum ExtractionEngine {
+  LLM
+  DETERMINISTIC
+  MANUAL
+}
+
+enum MatchMethod {
+  EXACT_SKU
+  EXACT_OEM
+  EXACT_BARCODE
+  CROSS_REFERENCE
+  SUPPLIER_PART_NUMBER
+  FUZZY_NAME
+  VEHICLE_COMPATIBILITY
+  MANUAL
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  SKIPPED_DUPLICATE
+}
+
+enum JobState {
+  CREATED
+  ACTIVE
+  COMPLETED
+  FAILED
+  CANCELLED
+  RETRY
+}
+
+enum DocumentKind {
+  QUOTATION
+  SALES_ORDER
+  DELIVERY_NOTE
+  SALES_INVOICE
+  SALES_RETURN
+  CREDIT_NOTE
+  PURCHASE_REQUEST
+  PURCHASE_ORDER
+  GOODS_RECEIPT
+  SUPPLIER_INVOICE
+  PURCHASE_RETURN
+  STOCK_ADJUSTMENT
+  STOCK_TRANSFER
+  STOCKTAKE
+  TICKET
+  CUSTOMER
+  SUPPLIER
+  PAYMENT
+}
+
+enum DiscountKind {
+  NONE
+  PERCENT
+  AMOUNT
+}
+
+// ========================= IDENTITY AND ACCESS =============================
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String
+  /// scrypt digest, encoded as: scrypt$N$r$p$<saltB64>$<hashB64>
+  passwordHash String
+  phone        String?
+  avatarFileId String?
+  status       RecordStatus @default(ACTIVE)
+  departmentId String?
+  isSuperAdmin Boolean      @default(false)
+  timezone     String?
+  lastLoginAt  DateTime?    @db.Timestamptz(6)
+  /// Incremented on password change / forced logout to invalidate sessions.
+  tokenVersion Int          @default(0)
+  createdAt    DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime     @updatedAt @db.Timestamptz(6)
+  deletedAt    DateTime?    @db.Timestamptz(6)
+
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  avatar     StoredFile? @relation("UserAvatar", fields: [avatarFileId], references: [id], onDelete: SetNull)
+
+  roles              UserRole[]
+  sessions           Session[]
+  auditLogs          AuditLog[]
+  assignedCustomers  Customer[]            @relation("CustomerSalesperson")
+  ticketsAssigned    Ticket[]              @relation("TicketAssignee")
+  ticketsCreated     Ticket[]              @relation("TicketCreatedBy")
+  ticketMessages     TicketMessage[]       @relation("TicketMessageAuthor")
+  ticketAssignments  TicketAssignment[]
+  assignmentsMade    TicketAssignment[]    @relation("TicketAssignmentActor")
+  statusChanges      TicketStatusHistory[]
+  ticketEvents       TicketEvent[]
+  quotationsCreated  Quotation[]           @relation("QuotationCreatedBy")
+  salesOrdersCreated SalesOrder[]          @relation("SalesOrderCreatedBy")
+  extractionReviews  ExtractionCorrection[]
+  orderApprovals     OrderApproval[]
+  stockMovements     StockMovement[]
+  mentions           TicketMention[]       @relation("MentionedUser")
+  mentionsAuthored   TicketMention[]       @relation("MentionAuthor")
+
+  @@index([departmentId])
+  @@index([status])
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  /// Stable machine key, e.g. "SALES". Referenced by seeds and tests.
+  key         String   @unique
+  name        String
+  description String?
+  /// System roles cannot be deleted or renamed through the UI.
+  isSystem    Boolean  @default(false)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  users       UserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(cuid())
+  /// "resource:action", e.g. "sales_order:create"
+  key         String   @unique
+  resource    String
+  action      String
+  description String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  roles RolePermission[]
+
+  @@unique([resource, action])
+  @@index([resource])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  grantedAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId     String
+  roleId     String
+  assignedAt DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@map("user_roles")
+}
+
+model Department {
+  id        String       @id @default(cuid())
+  key       String       @unique
+  name      String
+  email     String?
+  status    RecordStatus @default(ACTIVE)
+  /// Default SLA applied to tickets routed here.
+  slaId     String?
+  createdAt DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime     @updatedAt @db.Timestamptz(6)
+
+  sla TicketSla? @relation(fields: [slaId], references: [id], onDelete: SetNull)
+
+  users     User[]
+  tickets   Ticket[]
+  mailboxes EmailMailbox[]
+  channels  CommunicationChannel[]
+
+  @@map("departments")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  /// SHA-256 of the opaque bearer token. The raw token is never stored.
+  tokenHash String   @unique
+  userId    String
+  ipAddress String?
+  userAgent String?
+  expiresAt DateTime @db.Timestamptz(6)
+  revokedAt DateTime? @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  lastSeenAt DateTime @default(now()) @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ============================== CUSTOMERS ==================================
+
+model Customer {
+  id              String       @id @default(cuid())
+  code            String       @unique
+  name            String
+  legalName       String?
+  customerType    CustomerType @default(BUSINESS)
+  taxId           String?
+  taxName         String?
+  /// Primary contact channels, duplicated here for fast lookup. Authoritative
+  /// per-contact channels live on CustomerContact.
+  primaryEmail    String?
+  primaryPhone    String?
+  website         String?
+  priceLevelId    String?
+  salespersonId   String?
+  paymentTermDays Int          @default(0)
+  creditLimit     Decimal      @default(0) @db.Decimal(18, 4)
+  currency        String       @default("IDR")
+  status          RecordStatus @default(ACTIVE)
+  notes           String?
+  createdAt       DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(6)
+  deletedAt       DateTime?    @db.Timestamptz(6)
+
+  priceLevel  CustomerPriceLevel? @relation(fields: [priceLevelId], references: [id], onDelete: SetNull)
+  salesperson User?               @relation("CustomerSalesperson", fields: [salespersonId], references: [id], onDelete: SetNull)
+
+  contacts     CustomerContact[]
+  addresses    CustomerAddress[]
+  tickets      Ticket[]
+  quotations   Quotation[]
+  salesOrders  SalesOrder[]
+  invoices     SalesInvoice[]
+  payments     Payment[]
+  returns      SalesReturn[]
+  orderDrafts  OrderDraft[]
+  shipments    Shipment[]
+  externalMsgs ExternalMessage[]
+  creditNotes  CreditNote[]
+
+  @@index([name])
+  @@index([primaryEmail])
+  @@index([primaryPhone])
+  @@index([status])
+  @@index([salespersonId])
+  @@map("customers")
+}
+
+model CustomerContact {
+  id         String       @id @default(cuid())
+  customerId String
+  name       String
+  position   String?
+  email      String?
+  /// Normalised E.164, e.g. +628123456789. Used for WhatsApp matching.
+  phoneE164  String?
+  whatsappE164 String?
+  isPrimary  Boolean      @default(false)
+  /// Only a human may set this. Verified identifiers are the ONLY ones trusted
+  /// for automatic customer matching on inbound messages.
+  emailVerified    Boolean @default(false)
+  whatsappVerified Boolean @default(false)
+  status     RecordStatus @default(ACTIVE)
+  notes      String?
+  createdAt  DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime     @updatedAt @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  tickets      Ticket[]
+  externalMsgs ExternalMessage[]
+
+  @@index([customerId])
+  @@index([email])
+  @@index([phoneE164])
+  @@index([whatsappE164])
+  @@map("customer_contacts")
+}
+
+model CustomerAddress {
+  id          String      @id @default(cuid())
+  customerId  String
+  kind        AddressKind
+  label       String?
+  recipient   String?
+  phone       String?
+  line1       String
+  line2       String?
+  district    String?
+  city        String?
+  province    String?
+  postalCode  String?
+  country     String      @default("ID")
+  isDefault   Boolean     @default(false)
+  createdAt   DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime    @updatedAt @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  quotations         Quotation[]
+  salesOrdersBilling SalesOrder[] @relation("SalesOrderBillingAddress")
+  salesOrdersShip    SalesOrder[] @relation("SalesOrderShippingAddress")
+  shipments          Shipment[]
+
+  @@index([customerId, kind])
+  @@map("customer_addresses")
+}
+
+/// A named pricing tier. Resolution order in the pricing service is:
+/// customer price-level override -> price-level default rule -> product list price.
+model CustomerPriceLevel {
+  id              String       @id @default(cuid())
+  code            String       @unique
+  name            String
+  /// Applied to the product's base selling price when no explicit override row
+  /// exists. Negative = discount, positive = markup. Percent.
+  defaultAdjustPct Decimal     @default(0) @db.Decimal(9, 4)
+  status          RecordStatus @default(ACTIVE)
+  notes           String?
+  createdAt       DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(6)
+
+  customers Customer[]
+  prices    ProductPrice[]
+
+  @@map("customer_price_levels")
+}
+
+// ============================== INVENTORY ==================================
+
+model ProductCategory {
+  id        String           @id @default(cuid())
+  code      String           @unique
+  name      String
+  parentId  String?
+  status    RecordStatus     @default(ACTIVE)
+  createdAt DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime         @updatedAt @db.Timestamptz(6)
+
+  parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children ProductCategory[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId])
+  @@map("product_categories")
+}
+
+model Manufacturer {
+  id        String       @id @default(cuid())
+  code      String       @unique
+  name      String
+  country   String?
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime     @updatedAt @db.Timestamptz(6)
+
+  brands   Brand[]
+  products Product[]
+
+  @@map("manufacturers")
+}
+
+model Brand {
+  id             String       @id @default(cuid())
+  code           String       @unique
+  name           String
+  manufacturerId String?
+  status         RecordStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(6)
+
+  manufacturer Manufacturer? @relation(fields: [manufacturerId], references: [id], onDelete: SetNull)
+  products     Product[]
+
+  @@index([manufacturerId])
+  @@map("brands")
+}
+
+model UnitOfMeasure {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  /// Whether fractional quantities are permitted (e.g. litres yes, pcs no).
+  allowsFraction Boolean @default(false)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  products Product[]
+
+  @@map("units_of_measure")
+}
+
+model Product {
+  id             String       @id @default(cuid())
+  /// Internal part number.
+  sku            String       @unique
+  /// Manufacturer/OEM part number. Not unique: different brands legitimately
+  /// share an OEM reference.
+  oemNumber      String?
+  barcode        String?      @unique
+  name           String
+  description    String?
+  categoryId     String?
+  brandId        String?
+  manufacturerId String?
+  unitId         String
+  /// Weighted-average purchase cost, maintained by goods receipt postings.
+  purchaseCost   Decimal      @default(0) @db.Decimal(18, 4)
+  /// Base list price before any price-level adjustment.
+  sellingPrice   Decimal      @default(0) @db.Decimal(18, 4)
+  taxRatePct     Decimal      @default(11) @db.Decimal(9, 4)
+  minStockLevel  Decimal      @default(0) @db.Decimal(18, 3)
+  maxStockLevel  Decimal?     @db.Decimal(18, 3)
+  weightKg       Decimal?     @db.Decimal(12, 3)
+  status         RecordStatus @default(ACTIVE)
+  isSerialised   Boolean      @default(false)
+  notes          String?
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(6)
+  deletedAt      DateTime?    @db.Timestamptz(6)
+
+  category     ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  brand        Brand?           @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  manufacturer Manufacturer?    @relation(fields: [manufacturerId], references: [id], onDelete: SetNull)
+  unit         UnitOfMeasure    @relation(fields: [unitId], references: [id])
+
+  compatibilities   VehicleCompatibility[]
+  crossRefsFrom     ProductCrossReference[] @relation("CrossRefSource")
+  crossRefsTo       ProductCrossReference[] @relation("CrossRefTarget")
+  prices            ProductPrice[]
+  balances          InventoryBalance[]
+  movements         StockMovement[]
+  reservations      StockReservation[]
+  quotationItems    QuotationItem[]
+  salesOrderItems   SalesOrderItem[]
+  shipmentItems     ShipmentItem[]
+  invoiceItems      SalesInvoiceItem[]
+  purchaseReqItems  PurchaseRequestItem[]
+  purchaseItems     PurchaseOrderItem[]
+  receiptItems      GoodsReceiptItem[]
+  supplierProducts  SupplierProduct[]
+  adjustmentItems   StockAdjustmentItem[]
+  transferItems     StockTransferItem[]
+  stocktakeItems    StocktakeItem[]
+  returnItems       SalesReturnItem[]
+  purchaseReturnItems PurchaseReturnItem[]
+  draftItems        OrderDraftItem[]
+  matchCandidates   ProductMatchCandidate[]
+
+  @@index([name])
+  @@index([oemNumber])
+  @@index([brandId])
+  @@index([categoryId])
+  @@index([manufacturerId])
+  @@index([status])
+  @@map("products")
+}
+
+/// Explicit per-price-level override. Absence means "use the level's
+/// defaultAdjustPct against Product.sellingPrice".
+model ProductPrice {
+  id           String   @id @default(cuid())
+  productId    String
+  priceLevelId String
+  price        Decimal  @db.Decimal(18, 4)
+  minQuantity  Decimal  @default(1) @db.Decimal(18, 3)
+  validFrom    DateTime? @db.Timestamptz(6)
+  validTo      DateTime? @db.Timestamptz(6)
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime @updatedAt @db.Timestamptz(6)
+
+  product    Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+  priceLevel CustomerPriceLevel @relation(fields: [priceLevelId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, priceLevelId, minQuantity])
+  @@index([priceLevelId])
+  @@map("product_prices")
+}
+
+model VehicleCompatibility {
+  id            String   @id @default(cuid())
+  productId     String
+  make          String
+  model          String?
+  engine        String?
+  yearFrom      Int?
+  yearTo        Int?
+  notes         String?
+  createdAt     DateTime @default(now()) @db.Timestamptz(6)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([make, model])
+  @@map("vehicle_compatibilities")
+}
+
+/// An explicit, human-asserted interchangeability claim between two parts.
+/// The matcher will NEVER infer equivalence from similar part numbers; only
+/// rows in this table justify substituting one product for another.
+model ProductCrossReference {
+  id              String   @id @default(cuid())
+  productId       String
+  relatedProductId String?
+  /// Free-text competitor/OEM number when the counterpart is not stocked.
+  externalNumber  String?
+  externalBrand   String?
+  /// Who asserted this, for auditability.
+  assertedBy      String?
+  isBidirectional Boolean  @default(true)
+  notes           String?
+  createdAt       DateTime @default(now()) @db.Timestamptz(6)
+
+  product        Product  @relation("CrossRefSource", fields: [productId], references: [id], onDelete: Cascade)
+  relatedProduct Product? @relation("CrossRefTarget", fields: [relatedProductId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([relatedProductId])
+  @@index([externalNumber])
+  @@map("product_cross_references")
+}
+
+model Warehouse {
+  id        String       @id @default(cuid())
+  code      String       @unique
+  name      String
+  addressLine String?
+  city      String?
+  isDefault Boolean      @default(false)
+  status    RecordStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime     @updatedAt @db.Timestamptz(6)
+
+  locations      StockLocation[]
+  balances       InventoryBalance[]
+  movements      StockMovement[]
+  reservations   StockReservation[]
+  salesOrders    SalesOrder[]
+  shipments      Shipment[]
+  purchaseOrders PurchaseOrder[]
+  receipts       GoodsReceipt[]
+  adjustments    StockAdjustment[]
+  transfersOut   StockTransfer[]    @relation("TransferFrom")
+  transfersIn    StockTransfer[]    @relation("TransferTo")
+  stocktakes     Stocktake[]
+
+  @@map("warehouses")
+}
+
+model StockLocation {
+  id          String       @id @default(cuid())
+  warehouseId String
+  code        String
+  name        String?
+  /// Rack/bin breakdown for picking.
+  zone        String?
+  status      RecordStatus @default(ACTIVE)
+  createdAt   DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime     @updatedAt @db.Timestamptz(6)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  movements    StockMovement[]
+  reservations StockReservation[]
+
+  @@unique([warehouseId, code])
+  @@map("stock_locations")
+}
+
+/// Derived cache of the StockMovement ledger. Written ONLY inside the same
+/// transaction as the movement that caused the change (see inventory service).
+/// `reserved` is maintained from StockReservation rows.
+///
+/// Deliberately keyed at (product, warehouse) and NOT (product, warehouse,
+/// location): PostgreSQL treats NULLs as distinct in a unique index, so a
+/// nullable locationId in the key would silently permit duplicate balance rows
+/// for the same product whenever no bin is specified — and a duplicated
+/// balance row is an unreconcilable stock figure. Bin-level detail lives on
+/// StockMovement.locationId and is aggregated on demand for picking.
+model InventoryBalance {
+  id          String   @id @default(cuid())
+  productId   String
+  warehouseId String
+  onHand      Decimal  @default(0) @db.Decimal(18, 3)
+  reserved    Decimal  @default(0) @db.Decimal(18, 3)
+  /// Confirmed inbound purchase quantity not yet received.
+  incoming    Decimal  @default(0) @db.Decimal(18, 3)
+  /// Moving-average unit cost, used for inventory valuation.
+  avgCost     Decimal  @default(0) @db.Decimal(18, 4)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, warehouseId])
+  @@index([warehouseId])
+  @@index([productId])
+  @@map("inventory_balances")
+}
+
+/// Append-only ledger. Never updated or deleted; corrections are new rows.
+model StockMovement {
+  id            String            @id @default(cuid())
+  productId     String
+  warehouseId   String
+  locationId    String?
+  type          StockMovementType
+  /// Signed: positive increases on-hand, negative decreases it.
+  quantity      Decimal           @db.Decimal(18, 3)
+  unitCost      Decimal           @default(0) @db.Decimal(18, 4)
+  /// Running on-hand for this product/warehouse AFTER applying this row.
+  balanceAfter  Decimal           @db.Decimal(18, 3)
+  /// Business document that justifies the movement.
+  referenceKind DocumentKind?
+  referenceId   String?
+  referenceNo   String?
+  notes         String?
+  createdById   String?
+  occurredAt    DateTime          @default(now()) @db.Timestamptz(6)
+  createdAt     DateTime          @default(now()) @db.Timestamptz(6)
+
+  product   Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  location  StockLocation? @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  createdBy User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([productId, warehouseId, occurredAt])
+  @@index([referenceKind, referenceId])
+  @@index([occurredAt])
+  @@map("stock_movements")
+}
+
+/// Soft allocation of stock to a confirmed sales order. Created only by the
+/// sales-order confirmation path, never by a ticket or an extraction draft.
+model StockReservation {
+  id             String            @id @default(cuid())
+  productId      String
+  warehouseId    String
+  locationId     String?
+  quantity       Decimal           @db.Decimal(18, 3)
+  status         ReservationStatus @default(ACTIVE)
+  salesOrderId   String?
+  salesOrderItemId String?         @unique
+  expiresAt      DateTime?         @db.Timestamptz(6)
+  releasedAt     DateTime?         @db.Timestamptz(6)
+  createdAt      DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime          @updatedAt @db.Timestamptz(6)
+
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  warehouse      Warehouse       @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  location       StockLocation?  @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  salesOrder     SalesOrder?     @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  salesOrderItem SalesOrderItem? @relation(fields: [salesOrderItemId], references: [id], onDelete: Cascade)
+
+  @@index([productId, warehouseId, status])
+  @@index([salesOrderId])
+  @@map("stock_reservations")
+}
+
+model StockAdjustment {
+  id          String                @id @default(cuid())
+  number      String                @unique
+  warehouseId String
+  status      StockAdjustmentStatus @default(DRAFT)
+  reason      String
+  notes       String?
+  postedAt    DateTime?             @db.Timestamptz(6)
+  createdById String?
+  createdAt   DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime              @updatedAt @db.Timestamptz(6)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  items StockAdjustmentItem[]
+
+  @@index([warehouseId])
+  @@index([status])
+  @@map("stock_adjustments")
+}
+
+model StockAdjustmentItem {
+  id           String  @id @default(cuid())
+  adjustmentId String
+  productId    String
+  locationId   String?
+  /// Signed delta applied to on-hand when the adjustment is posted.
+  quantity     Decimal @db.Decimal(18, 3)
+  unitCost     Decimal @default(0) @db.Decimal(18, 4)
+  notes        String?
+
+  adjustment StockAdjustment @relation(fields: [adjustmentId], references: [id], onDelete: Cascade)
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([adjustmentId])
+  @@index([productId])
+  @@map("stock_adjustment_items")
+}
+
+model StockTransfer {
+  id              String         @id @default(cuid())
+  number          String         @unique
+  fromWarehouseId String
+  toWarehouseId   String
+  status          TransferStatus @default(DRAFT)
+  notes           String?
+  shippedAt       DateTime?      @db.Timestamptz(6)
+  receivedAt      DateTime?      @db.Timestamptz(6)
+  createdById     String?
+  createdAt       DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime       @updatedAt @db.Timestamptz(6)
+
+  fromWarehouse Warehouse @relation("TransferFrom", fields: [fromWarehouseId], references: [id], onDelete: Restrict)
+  toWarehouse   Warehouse @relation("TransferTo", fields: [toWarehouseId], references: [id], onDelete: Restrict)
+
+  items StockTransferItem[]
+
+  @@index([status])
+  @@map("stock_transfers")
+}
+
+model StockTransferItem {
+  id         String  @id @default(cuid())
+  transferId String
+  productId  String
+  quantity   Decimal @db.Decimal(18, 3)
+  receivedQty Decimal @default(0) @db.Decimal(18, 3)
+
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  product  Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([transferId])
+  @@map("stock_transfer_items")
+}
+
+model Stocktake {
+  id          String          @id @default(cuid())
+  number      String          @unique
+  warehouseId String
+  status      StocktakeStatus @default(DRAFT)
+  notes       String?
+  countedAt   DateTime?       @db.Timestamptz(6)
+  postedAt    DateTime?       @db.Timestamptz(6)
+  createdById String?
+  createdAt   DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime        @updatedAt @db.Timestamptz(6)
+
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  items StocktakeItem[]
+
+  @@index([warehouseId])
+  @@map("stocktakes")
+}
+
+model StocktakeItem {
+  id          String   @id @default(cuid())
+  stocktakeId String
+  productId   String
+  locationId  String?
+  /// On-hand snapshot at the moment the count sheet was generated.
+  systemQty   Decimal  @db.Decimal(18, 3)
+  countedQty  Decimal? @db.Decimal(18, 3)
+  notes       String?
+
+  stocktake Stocktake @relation(fields: [stocktakeId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@unique([stocktakeId, productId, locationId])
+  @@index([productId])
+  @@map("stocktake_items")
+}
+
+// ======================= SUPPLIERS AND PURCHASING ==========================
+
+model Supplier {
+  id              String       @id @default(cuid())
+  code            String       @unique
+  name            String
+  legalName       String?
+  taxId           String?
+  primaryEmail    String?
+  primaryPhone    String?
+  website         String?
+  addressLine     String?
+  city            String?
+  province        String?
+  postalCode      String?
+  country         String       @default("ID")
+  paymentTermDays Int          @default(0)
+  currency        String       @default("IDR")
+  status          RecordStatus @default(ACTIVE)
+  notes           String?
+  createdAt       DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(6)
+  deletedAt       DateTime?    @db.Timestamptz(6)
+
+  contacts         SupplierContact[]
+  products         SupplierProduct[]
+  purchaseOrders   PurchaseOrder[]
+  receipts         GoodsReceipt[]
+  invoices         SupplierInvoice[]
+  payments         SupplierPayment[]
+  returns          PurchaseReturn[]
+
+  @@index([name])
+  @@index([status])
+  @@map("suppliers")
+}
+
+model SupplierContact {
+  id         String       @id @default(cuid())
+  supplierId String
+  name       String
+  position   String?
+  email      String?
+  phoneE164  String?
+  isPrimary  Boolean      @default(false)
+  status     RecordStatus @default(ACTIVE)
+  createdAt  DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime     @updatedAt @db.Timestamptz(6)
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([supplierId])
+  @@map("supplier_contacts")
+}
+
+/// Supplier-specific part number + last negotiated cost for a product we stock.
+/// Also a legitimate matching source for inbound customer messages that quote a
+/// supplier's catalogue number.
+model SupplierProduct {
+  id               String   @id @default(cuid())
+  supplierId       String
+  productId        String
+  supplierPartNo   String
+  leadTimeDays     Int?
+  lastPurchaseCost Decimal? @db.Decimal(18, 4)
+  minOrderQty      Decimal  @default(1) @db.Decimal(18, 3)
+  isPreferred      Boolean  @default(false)
+  createdAt        DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime @updatedAt @db.Timestamptz(6)
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, productId])
+  @@index([supplierPartNo])
+  @@index([productId])
+  @@map("supplier_products")
+}
+
+model PurchaseRequest {
+  id          String                @id @default(cuid())
+  number      String                @unique
+  status      PurchaseRequestStatus @default(DRAFT)
+  requestedBy String?
+  neededBy    DateTime?             @db.Timestamptz(6)
+  notes       String?
+  approvedAt  DateTime?             @db.Timestamptz(6)
+  approvedBy  String?
+  createdAt   DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime              @updatedAt @db.Timestamptz(6)
+
+  items          PurchaseRequestItem[]
+  purchaseOrders PurchaseOrder[]
+
+  @@index([status])
+  @@map("purchase_requests")
+}
+
+model PurchaseRequestItem {
+  id        String  @id @default(cuid())
+  requestId String
+  productId String
+  quantity  Decimal @db.Decimal(18, 3)
+  notes     String?
+
+  request PurchaseRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  product Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([requestId])
+  @@index([productId])
+  @@map("purchase_request_items")
+}
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  number       String              @unique
+  supplierId   String
+  warehouseId  String
+  requestId    String?
+  status       PurchaseOrderStatus @default(DRAFT)
+  currency     String              @default("IDR")
+  orderDate    DateTime            @default(now()) @db.Timestamptz(6)
+  expectedDate DateTime?           @db.Timestamptz(6)
+  subtotal     Decimal             @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal            @default(0) @db.Decimal(18, 4)
+  taxTotal     Decimal             @default(0) @db.Decimal(18, 4)
+  shippingFee  Decimal             @default(0) @db.Decimal(18, 4)
+  grandTotal   Decimal             @default(0) @db.Decimal(18, 4)
+  notes        String?
+  createdById  String?
+  confirmedAt  DateTime?           @db.Timestamptz(6)
+  cancelledAt  DateTime?           @db.Timestamptz(6)
+  createdAt    DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime            @updatedAt @db.Timestamptz(6)
+
+  supplier  Supplier         @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  warehouse Warehouse        @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  request   PurchaseRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  items    PurchaseOrderItem[]
+  receipts GoodsReceipt[]
+  invoices SupplierInvoice[]
+
+  @@index([supplierId])
+  @@index([status])
+  @@index([orderDate])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id              String  @id @default(cuid())
+  purchaseOrderId String
+  productId       String
+  description     String?
+  quantity        Decimal @db.Decimal(18, 3)
+  /// Cumulative quantity received across all goods receipts for this line.
+  receivedQty     Decimal @default(0) @db.Decimal(18, 3)
+  unitCost        Decimal @db.Decimal(18, 4)
+  discountPct     Decimal @default(0) @db.Decimal(9, 4)
+  taxRatePct      Decimal @default(0) @db.Decimal(9, 4)
+  lineTotal       Decimal @default(0) @db.Decimal(18, 4)
+  sortOrder       Int     @default(0)
+
+  purchaseOrder PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  receiptItems  GoodsReceiptItem[]
+
+  @@index([purchaseOrderId])
+  @@index([productId])
+  @@map("purchase_order_items")
+}
+
+model GoodsReceipt {
+  id              String    @id @default(cuid())
+  number          String    @unique
+  supplierId      String
+  warehouseId     String
+  purchaseOrderId String?
+  supplierDocNo   String?
+  receivedAt      DateTime  @default(now()) @db.Timestamptz(6)
+  /// Set when the stock movements for this receipt have been written.
+  postedAt        DateTime? @db.Timestamptz(6)
+  notes           String?
+  createdById     String?
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+
+  supplier      Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  warehouse     Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+
+  items GoodsReceiptItem[]
+
+  @@index([supplierId])
+  @@index([purchaseOrderId])
+  @@index([receivedAt])
+  @@map("goods_receipts")
+}
+
+model GoodsReceiptItem {
+  id            String  @id @default(cuid())
+  receiptId     String
+  productId     String
+  purchaseItemId String?
+  quantity      Decimal @db.Decimal(18, 3)
+  unitCost      Decimal @db.Decimal(18, 4)
+  locationId    String?
+  notes         String?
+
+  receipt      GoodsReceipt       @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  product      Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  purchaseItem PurchaseOrderItem? @relation(fields: [purchaseItemId], references: [id], onDelete: SetNull)
+
+  @@index([receiptId])
+  @@index([productId])
+  @@map("goods_receipt_items")
+}
+
+model SupplierInvoice {
+  id              String        @id @default(cuid())
+  number          String        @unique
+  supplierId      String
+  purchaseOrderId String?
+  supplierInvoiceNo String
+  status          InvoiceStatus @default(ISSUED)
+  issueDate       DateTime      @default(now()) @db.Timestamptz(6)
+  dueDate         DateTime?     @db.Timestamptz(6)
+  currency        String        @default("IDR")
+  subtotal        Decimal       @default(0) @db.Decimal(18, 4)
+  taxTotal        Decimal       @default(0) @db.Decimal(18, 4)
+  grandTotal      Decimal       @default(0) @db.Decimal(18, 4)
+  paidTotal       Decimal       @default(0) @db.Decimal(18, 4)
+  notes           String?
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  supplier      Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+
+  payments SupplierPayment[]
+
+  @@unique([supplierId, supplierInvoiceNo])
+  @@index([status])
+  @@index([dueDate])
+  @@map("supplier_invoices")
+}
+
+model SupplierPayment {
+  id         String        @id @default(cuid())
+  number     String        @unique
+  supplierId String
+  invoiceId  String?
+  method     PaymentMethod @default(BANK_TRANSFER)
+  amount     Decimal       @db.Decimal(18, 4)
+  currency   String        @default("IDR")
+  paidAt     DateTime      @default(now()) @db.Timestamptz(6)
+  reference  String?
+  notes      String?
+  createdAt  DateTime      @default(now()) @db.Timestamptz(6)
+
+  supplier Supplier         @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  invoice  SupplierInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([supplierId])
+  @@index([invoiceId])
+  @@map("supplier_payments")
+}
+
+model PurchaseReturn {
+  id          String    @id @default(cuid())
+  number      String    @unique
+  supplierId  String
+  reason      String
+  returnedAt  DateTime  @default(now()) @db.Timestamptz(6)
+  postedAt    DateTime? @db.Timestamptz(6)
+  notes       String?
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  items PurchaseReturnItem[]
+
+  @@index([supplierId])
+  @@map("purchase_returns")
+}
+
+model PurchaseReturnItem {
+  id        String  @id @default(cuid())
+  returnId  String
+  productId String
+  quantity  Decimal @db.Decimal(18, 3)
+  unitCost  Decimal @default(0) @db.Decimal(18, 4)
+
+  purchaseReturn PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  product        Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([returnId])
+  @@index([productId])
+  @@map("purchase_return_items")
+}
+
+// =============================== SALES =====================================
+
+model Quotation {
+  id            String          @id @default(cuid())
+  number        String          @unique
+  customerId    String
+  ticketId      String?
+  orderDraftId  String?
+  addressId     String?
+  status        QuotationStatus @default(DRAFT)
+  currency      String          @default("IDR")
+  quoteDate     DateTime        @default(now()) @db.Timestamptz(6)
+  validUntil    DateTime?       @db.Timestamptz(6)
+  priceLevelId  String?
+  subtotal      Decimal         @default(0) @db.Decimal(18, 4)
+  discountKind  DiscountKind    @default(NONE)
+  discountValue Decimal         @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal         @default(0) @db.Decimal(18, 4)
+  taxTotal      Decimal         @default(0) @db.Decimal(18, 4)
+  shippingFee   Decimal         @default(0) @db.Decimal(18, 4)
+  grandTotal    Decimal         @default(0) @db.Decimal(18, 4)
+  terms         String?
+  notes         String?
+  createdById   String?
+  sentAt        DateTime?       @db.Timestamptz(6)
+  acceptedAt    DateTime?       @db.Timestamptz(6)
+  createdAt     DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime        @updatedAt @db.Timestamptz(6)
+
+  customer   Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  ticket     Ticket?          @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  orderDraft OrderDraft?      @relation(fields: [orderDraftId], references: [id], onDelete: SetNull)
+  address    CustomerAddress? @relation(fields: [addressId], references: [id], onDelete: SetNull)
+  createdBy  User?            @relation("QuotationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  items       QuotationItem[]
+  salesOrders SalesOrder[]
+
+  @@index([customerId])
+  @@index([ticketId])
+  @@index([status])
+  @@index([quoteDate])
+  @@map("quotations")
+}
+
+model QuotationItem {
+  id          String  @id @default(cuid())
+  quotationId String
+  productId   String?
+  /// Retained verbatim so a quoted line still reads correctly if the product is
+  /// later renamed, and so non-catalogue lines can be quoted.
+  description String
+  quantity    Decimal @db.Decimal(18, 3)
+  unitPrice   Decimal @db.Decimal(18, 4)
+  discountPct Decimal @default(0) @db.Decimal(9, 4)
+  taxRatePct  Decimal @default(0) @db.Decimal(9, 4)
+  lineSubtotal Decimal @default(0) @db.Decimal(18, 4)
+  lineTax     Decimal @default(0) @db.Decimal(18, 4)
+  lineTotal   Decimal @default(0) @db.Decimal(18, 4)
+  sortOrder   Int     @default(0)
+  notes       String?
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  product   Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([quotationId])
+  @@index([productId])
+  @@map("quotation_items")
+}
+
+model SalesOrder {
+  id            String           @id @default(cuid())
+  number        String           @unique
+  customerId    String
+  warehouseId   String
+  quotationId   String?
+  ticketId      String?
+  orderDraftId  String?          @unique
+  billingAddressId  String?
+  shippingAddressId String?
+  status        SalesOrderStatus @default(DRAFT)
+  fulfillment   FulfillmentStatus @default(PENDING)
+  currency      String           @default("IDR")
+  orderDate     DateTime         @default(now()) @db.Timestamptz(6)
+  requestedDeliveryDate DateTime? @db.Timestamptz(6)
+  priceLevelId  String?
+  subtotal      Decimal          @default(0) @db.Decimal(18, 4)
+  discountKind  DiscountKind     @default(NONE)
+  discountValue Decimal          @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal          @default(0) @db.Decimal(18, 4)
+  taxTotal      Decimal          @default(0) @db.Decimal(18, 4)
+  shippingFee   Decimal          @default(0) @db.Decimal(18, 4)
+  grandTotal    Decimal          @default(0) @db.Decimal(18, 4)
+  /// Allows a backorder to be confirmed with insufficient stock on purpose.
+  allowBackorder Boolean         @default(false)
+  notes         String?
+  createdById   String?
+  confirmedAt   DateTime?        @db.Timestamptz(6)
+  cancelledAt   DateTime?        @db.Timestamptz(6)
+  cancelReason  String?
+  createdAt     DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime         @updatedAt @db.Timestamptz(6)
+
+  customer        Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  warehouse       Warehouse        @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  quotation       Quotation?       @relation(fields: [quotationId], references: [id], onDelete: SetNull)
+  ticket          Ticket?          @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  orderDraft      OrderDraft?      @relation(fields: [orderDraftId], references: [id], onDelete: SetNull)
+  billingAddress  CustomerAddress? @relation("SalesOrderBillingAddress", fields: [billingAddressId], references: [id], onDelete: SetNull)
+  shippingAddress CustomerAddress? @relation("SalesOrderShippingAddress", fields: [shippingAddressId], references: [id], onDelete: SetNull)
+  createdBy       User?            @relation("SalesOrderCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  items        SalesOrderItem[]
+  reservations StockReservation[]
+  shipments    Shipment[]
+  invoices     SalesInvoice[]
+  returns      SalesReturn[]
+
+  @@index([customerId])
+  @@index([ticketId])
+  @@index([status])
+  @@index([orderDate])
+  @@map("sales_orders")
+}
+
+model SalesOrderItem {
+  id           String  @id @default(cuid())
+  salesOrderId String
+  productId    String?
+  description  String
+  quantity     Decimal @db.Decimal(18, 3)
+  /// Cumulative quantity shipped; drives PARTIALLY_FULFILLED vs FULFILLED.
+  shippedQty   Decimal @default(0) @db.Decimal(18, 3)
+  invoicedQty  Decimal @default(0) @db.Decimal(18, 3)
+  unitPrice    Decimal @db.Decimal(18, 4)
+  discountPct  Decimal @default(0) @db.Decimal(9, 4)
+  taxRatePct   Decimal @default(0) @db.Decimal(9, 4)
+  lineSubtotal Decimal @default(0) @db.Decimal(18, 4)
+  lineTax      Decimal @default(0) @db.Decimal(18, 4)
+  lineTotal    Decimal @default(0) @db.Decimal(18, 4)
+  sortOrder    Int     @default(0)
+  notes        String?
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  product    Product?   @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  reservation   StockReservation?
+  shipmentItems ShipmentItem[]
+  invoiceItems  SalesInvoiceItem[]
+
+  @@index([salesOrderId])
+  @@index([productId])
+  @@map("sales_order_items")
+}
+
+model Shipment {
+  id           String            @id @default(cuid())
+  number       String            @unique
+  salesOrderId String
+  customerId   String
+  warehouseId  String
+  addressId    String?
+  status       FulfillmentStatus @default(PENDING)
+  carrier      String?
+  trackingNo   String?
+  pickedAt     DateTime?         @db.Timestamptz(6)
+  packedAt     DateTime?         @db.Timestamptz(6)
+  shippedAt    DateTime?         @db.Timestamptz(6)
+  deliveredAt  DateTime?         @db.Timestamptz(6)
+  /// Set when the outbound stock movements for this shipment were written.
+  postedAt     DateTime?         @db.Timestamptz(6)
+  notes        String?
+  createdAt    DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime          @updatedAt @db.Timestamptz(6)
+
+  salesOrder SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Restrict)
+  customer   Customer         @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  warehouse  Warehouse        @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+  address    CustomerAddress? @relation(fields: [addressId], references: [id], onDelete: SetNull)
+
+  items ShipmentItem[]
+
+  @@index([salesOrderId])
+  @@index([status])
+  @@map("shipments")
+}
+
+model ShipmentItem {
+  id           String  @id @default(cuid())
+  shipmentId   String
+  salesOrderItemId String?
+  productId    String
+  quantity     Decimal @db.Decimal(18, 3)
+  locationId   String?
+
+  shipment       Shipment        @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  salesOrderItem SalesOrderItem? @relation(fields: [salesOrderItemId], references: [id], onDelete: SetNull)
+  product        Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([shipmentId])
+  @@index([productId])
+  @@map("shipment_items")
+}
+
+model SalesInvoice {
+  id           String        @id @default(cuid())
+  number       String        @unique
+  customerId   String
+  salesOrderId String?
+  status       InvoiceStatus @default(DRAFT)
+  currency     String        @default("IDR")
+  issueDate    DateTime      @default(now()) @db.Timestamptz(6)
+  dueDate      DateTime?     @db.Timestamptz(6)
+  subtotal     Decimal       @default(0) @db.Decimal(18, 4)
+  discountTotal Decimal      @default(0) @db.Decimal(18, 4)
+  taxTotal     Decimal       @default(0) @db.Decimal(18, 4)
+  shippingFee  Decimal       @default(0) @db.Decimal(18, 4)
+  grandTotal   Decimal       @default(0) @db.Decimal(18, 4)
+  /// Maintained by the payment service from PaymentAllocation rows.
+  paidTotal    Decimal       @default(0) @db.Decimal(18, 4)
+  notes        String?
+  issuedAt     DateTime?     @db.Timestamptz(6)
+  createdAt    DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime      @updatedAt @db.Timestamptz(6)
+
+  customer   Customer    @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  salesOrder SalesOrder? @relation(fields: [salesOrderId], references: [id], onDelete: SetNull)
+
+  items       SalesInvoiceItem[]
+  allocations PaymentAllocation[]
+  creditNotes CreditNote[]
+
+  @@index([customerId])
+  @@index([salesOrderId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("sales_invoices")
+}
+
+model SalesInvoiceItem {
+  id           String  @id @default(cuid())
+  invoiceId    String
+  productId    String?
+  salesOrderItemId String?
+  description  String
+  quantity     Decimal @db.Decimal(18, 3)
+  unitPrice    Decimal @db.Decimal(18, 4)
+  discountPct  Decimal @default(0) @db.Decimal(9, 4)
+  taxRatePct   Decimal @default(0) @db.Decimal(9, 4)
+  lineSubtotal Decimal @default(0) @db.Decimal(18, 4)
+  lineTax      Decimal @default(0) @db.Decimal(18, 4)
+  lineTotal    Decimal @default(0) @db.Decimal(18, 4)
+  sortOrder    Int     @default(0)
+
+  invoice        SalesInvoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product        Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  salesOrderItem SalesOrderItem? @relation(fields: [salesOrderItemId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([productId])
+  @@map("sales_invoice_items")
+}
+
+model Payment {
+  id         String           @id @default(cuid())
+  number     String           @unique
+  customerId String
+  direction  PaymentDirection @default(INBOUND)
+  method     PaymentMethod    @default(BANK_TRANSFER)
+  amount     Decimal          @db.Decimal(18, 4)
+  /// amount - sum(allocations). Kept so unapplied credit is queryable.
+  unappliedAmount Decimal     @default(0) @db.Decimal(18, 4)
+  currency   String           @default("IDR")
+  paidAt     DateTime         @default(now()) @db.Timestamptz(6)
+  reference  String?
+  notes      String?
+  createdAt  DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime         @updatedAt @db.Timestamptz(6)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  allocations PaymentAllocation[]
+
+  @@index([customerId])
+  @@index([paidAt])
+  @@map("payments")
+}
+
+/// Applies part of a payment to a specific invoice, so one transfer can settle
+/// several invoices and partial settlement is representable exactly.
+model PaymentAllocation {
+  id        String  @id @default(cuid())
+  paymentId String
+  invoiceId String
+  amount    Decimal @db.Decimal(18, 4)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  payment Payment      @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoice SalesInvoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@unique([paymentId, invoiceId])
+  @@index([invoiceId])
+  @@map("payment_allocations")
+}
+
+model SalesReturn {
+  id           String    @id @default(cuid())
+  number       String    @unique
+  customerId   String
+  salesOrderId String?
+  warehouseId  String?
+  reason       String
+  returnedAt   DateTime  @default(now()) @db.Timestamptz(6)
+  postedAt     DateTime? @db.Timestamptz(6)
+  notes        String?
+  createdAt    DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @db.Timestamptz(6)
+
+  customer   Customer    @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  salesOrder SalesOrder? @relation(fields: [salesOrderId], references: [id], onDelete: SetNull)
+
+  items       SalesReturnItem[]
+  creditNotes CreditNote[]
+
+  @@index([customerId])
+  @@map("sales_returns")
+}
+
+model SalesReturnItem {
+  id        String  @id @default(cuid())
+  returnId  String
+  productId String
+  quantity  Decimal @db.Decimal(18, 3)
+  unitPrice Decimal @default(0) @db.Decimal(18, 4)
+  /// Damaged returns should not go back into sellable stock.
+  restock   Boolean @default(true)
+  notes     String?
+
+  salesReturn SalesReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  product     Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([returnId])
+  @@index([productId])
+  @@map("sales_return_items")
+}
+
+model CreditNote {
+  id         String        @id @default(cuid())
+  number     String        @unique
+  customerId String
+  invoiceId  String?
+  returnId   String?
+  amount     Decimal       @db.Decimal(18, 4)
+  currency   String        @default("IDR")
+  reason     String
+  issueDate  DateTime      @default(now()) @db.Timestamptz(6)
+  notes      String?
+  createdAt  DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime      @updatedAt @db.Timestamptz(6)
+
+  customer    Customer      @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  invoice     SalesInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  salesReturn SalesReturn?  @relation(fields: [returnId], references: [id], onDelete: SetNull)
+
+  @@index([customerId])
+  @@index([invoiceId])
+  @@map("credit_notes")
+}
+
+// ============================== TICKETING ==================================
+
+model TicketSla {
+  id                  String   @id @default(cuid())
+  key                 String   @unique
+  name                String
+  /// Minutes of BUSINESS time allowed before the first staff reply is overdue.
+  firstResponseMins   Int
+  /// Minutes of BUSINESS time allowed before resolution is overdue.
+  resolutionMins      Int
+  /// Business hours as JSON: { "mon": ["08:00","17:00"], ... }. Null = 24/7.
+  businessHours       Json?
+  timezone            String   @default("Asia/Jakarta")
+  isDefault           Boolean  @default(false)
+  createdAt           DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime @updatedAt @db.Timestamptz(6)
+
+  departments Department[]
+  tickets     Ticket[]
+
+  @@map("ticket_slas")
+}
+
+/// Administrator-configurable allowed status transitions (§5.C). An empty
+/// table is treated by the service as "all transitions allowed".
+model TicketStatusTransition {
+  id         String       @id @default(cuid())
+  fromStatus TicketStatus
+  toStatus   TicketStatus
+  /// Permission key the actor must hold, if the transition is restricted.
+  requiresPermission String?
+  createdAt  DateTime     @default(now()) @db.Timestamptz(6)
+
+  @@unique([fromStatus, toStatus])
+  @@map("ticket_status_transitions")
+}
+
+model Ticket {
+  id           String         @id @default(cuid())
+  number       String         @unique
+  subject      String
+  source       ChannelType
+  status       TicketStatus   @default(NEW)
+  priority     TicketPriority @default(NORMAL)
+  customerId   String?
+  contactId    String?
+  departmentId String?
+  assigneeId   String?
+  slaId        String?
+  channelId    String?
+
+  /// Denormalised reply-tracking columns. Maintained by the ticket service on
+  /// every message insert; they back the dashboard counters and SLA reports,
+  /// which would otherwise need a correlated subquery per ticket.
+  firstResponseAt   DateTime? @db.Timestamptz(6)
+  lastCustomerAt    DateTime? @db.Timestamptz(6)
+  lastStaffAt       DateTime? @db.Timestamptz(6)
+  lastActivityAt    DateTime  @default(now()) @db.Timestamptz(6)
+  firstResponseDueAt DateTime? @db.Timestamptz(6)
+  resolutionDueAt   DateTime? @db.Timestamptz(6)
+  unreadForStaff    Int       @default(0)
+
+  /// Free-text identity captured when the sender could not be matched to a
+  /// customer. Never used to auto-create or auto-merge a Customer.
+  requesterName  String?
+  requesterEmail String?
+  requesterPhone String?
+
+  createdById String?
+  resolvedAt  DateTime? @db.Timestamptz(6)
+  closedAt    DateTime? @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(6)
+
+  customer   Customer?             @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  contact    CustomerContact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  department Department?           @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  assignee   User?                 @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdBy  User?                 @relation("TicketCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  sla        TicketSla?            @relation(fields: [slaId], references: [id], onDelete: SetNull)
+  channel    CommunicationChannel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+
+  messages       TicketMessage[]
+  attachments    TicketAttachment[]
+  assignments    TicketAssignment[]
+  statusHistory  TicketStatusHistory[]
+  events         TicketEvent[]
+  tags           TicketTagLink[]
+  externalRefs   TicketExternalReference[]
+  mentions       TicketMention[]
+  orderDrafts    OrderDraft[]
+  quotations     Quotation[]
+  salesOrders    SalesOrder[]
+  externalMsgs   ExternalMessage[]
+
+  @@index([status])
+  @@index([priority])
+  @@index([assigneeId])
+  @@index([departmentId])
+  @@index([customerId])
+  @@index([source])
+  @@index([lastActivityAt])
+  @@index([firstResponseDueAt])
+  @@map("tickets")
+}
+
+/// Every entry in a ticket conversation: customer replies, staff replies and
+/// internal notes. `visibility = INTERNAL` marks an internal note; the ticket
+/// service refuses to dispatch those outbound and the customer-facing
+/// serialiser strips them.
+model TicketMessage {
+  id         String            @id @default(cuid())
+  ticketId   String
+  direction  MessageDirection
+  visibility MessageVisibility @default(PUBLIC)
+  channel    ChannelType
+  authorId   String?
+  /// Display name for an inbound author who is not a system user.
+  authorName String?
+  bodyText   String
+  /// Sanitised HTML. Raw provider HTML is kept on ExternalMessage instead.
+  bodyHtml   String?
+  deliveryStatus DeliveryStatus @default(PENDING)
+  externalMessageId String?
+  sentAt     DateTime?         @db.Timestamptz(6)
+  readAt     DateTime?         @db.Timestamptz(6)
+  createdAt  DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime          @updatedAt @db.Timestamptz(6)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author User?  @relation("TicketMessageAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  attachments  TicketAttachment[]
+  externalMsg  ExternalMessage?
+  outboundAttempts OutboundMessageAttempt[]
+  mentions     TicketMention[]
+  extractionRuns ExtractionRun[]
+  orderDrafts  OrderDraft[]
+
+  @@index([ticketId, createdAt])
+  @@index([visibility])
+  @@index([externalMessageId])
+  @@map("ticket_messages")
+}
+
+model TicketAttachment {
+  id        String   @id @default(cuid())
+  ticketId  String
+  messageId String?
+  fileId    String
+  /// Mirrors the parent message's visibility so an internal-note attachment is
+  /// never served to a customer-facing surface.
+  visibility MessageVisibility @default(PUBLIC)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  ticket  Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  message TicketMessage? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  file    StoredFile     @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@index([ticketId])
+  @@index([messageId])
+  @@map("ticket_attachments")
+}
+
+model TicketAssignment {
+  id           String   @id @default(cuid())
+  ticketId     String
+  assigneeId   String?
+  departmentId String?
+  assignedById String?
+  note         String?
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+
+  ticket     Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  assignee   User?  @relation(fields: [assigneeId], references: [id], onDelete: SetNull)
+  assignedBy User?  @relation("TicketAssignmentActor", fields: [assignedById], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@index([assigneeId])
+  @@map("ticket_assignments")
+}
+
+model TicketStatusHistory {
+  id         String        @id @default(cuid())
+  ticketId   String
+  fromStatus TicketStatus?
+  toStatus   TicketStatus
+  changedById String?
+  reason     String?
+  createdAt  DateTime      @default(now()) @db.Timestamptz(6)
+
+  ticket    Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  changedBy User?  @relation(fields: [changedById], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_status_history")
+}
+
+model TicketTag {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  colour    String?
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  tickets TicketTagLink[]
+
+  @@map("ticket_tags")
+}
+
+model TicketTagLink {
+  ticketId  String
+  tagId     String
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  ticket Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  tag    TicketTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([ticketId, tagId])
+  @@index([tagId])
+  @@map("ticket_tag_links")
+}
+
+/// Append-only activity feed shown in the ticket history panel.
+model TicketEvent {
+  id        String   @id @default(cuid())
+  ticketId  String
+  /// e.g. "ticket.created", "ticket.status_changed", "draft.approved"
+  type      String
+  summary   String
+  payload   Json?
+  actorId   String?
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+  @@index([type])
+  @@map("ticket_events")
+}
+
+model TicketMention {
+  id        String   @id @default(cuid())
+  ticketId  String
+  messageId String?
+  userId    String
+  authorId  String?
+  readAt    DateTime? @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  ticket  Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  message TicketMessage? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User           @relation("MentionedUser", fields: [userId], references: [id], onDelete: Cascade)
+  author  User?          @relation("MentionAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt])
+  @@index([ticketId])
+  @@map("ticket_mentions")
+}
+
+/// Maps a provider-side conversation to a ticket. This is the key that makes
+/// reply threading deterministic instead of guessing from sender address:
+/// (channelType, refType, refValue) is globally unique.
+model TicketExternalReference {
+  id        String      @id @default(cuid())
+  ticketId  String
+  channel   ChannelType
+  /// "email_message_id" | "email_thread_root" | "whatsapp_conversation" | "whatsapp_wa_id"
+  refType   String
+  refValue  String
+  createdAt DateTime    @default(now()) @db.Timestamptz(6)
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@unique([channel, refType, refValue])
+  @@index([ticketId])
+  @@map("ticket_external_references")
+}
+
+// =========================== COMMUNICATION =================================
+
+model CommunicationChannel {
+  id           String       @id @default(cuid())
+  key          String       @unique
+  type         ChannelType
+  name         String
+  status       RecordStatus @default(ACTIVE)
+  /// Tickets created from this channel default to this department.
+  departmentId String?
+  createdAt    DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime     @updatedAt @db.Timestamptz(6)
+
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  configurations ChannelConfiguration[]
+  mailbox        EmailMailbox?
+  tickets        Ticket[]
+  externalMsgs   ExternalMessage[]
+  webhookEvents  ProcessedWebhookEvent[]
+
+  @@map("communication_channels")
+}
+
+/// Key/value channel settings. Secret values are stored encrypted at rest
+/// (AES-256-GCM via APP_ENCRYPTION_KEY) and are never returned to the client.
+model ChannelConfiguration {
+  id        String   @id @default(cuid())
+  channelId String
+  key       String
+  value     String?
+  isSecret  Boolean  @default(false)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  channel CommunicationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, key])
+  @@map("channel_configurations")
+}
+
+model EmailMailbox {
+  id           String       @id @default(cuid())
+  channelId    String       @unique
+  departmentId String?
+  address      String       @unique
+  imapHost     String
+  imapPort     Int          @default(993)
+  imapSecure   Boolean      @default(true)
+  imapUser     String
+  /// Encrypted at rest.
+  imapPassword String
+  imapFolder   String       @default("INBOX")
+  smtpHost     String
+  smtpPort     Int          @default(587)
+  smtpSecure   Boolean      @default(false)
+  smtpUser     String
+  /// Encrypted at rest.
+  smtpPassword String
+  fromName     String?
+  status       RecordStatus @default(ACTIVE)
+  /// IMAP UIDVALIDITY + highest processed UID, so a restart never re-ingests
+  /// mail and never silently skips it.
+  uidValidity  BigInt?
+  lastSeenUid  BigInt?
+  lastPolledAt DateTime?    @db.Timestamptz(6)
+  lastError    String?
+  createdAt    DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime     @updatedAt @db.Timestamptz(6)
+
+  channel    CommunicationChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  department Department?          @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+
+  @@map("email_mailboxes")
+}
+
+/// Verbatim inbound/outbound provider payload, preserved for audit (§8). The
+/// ticket conversation renders TicketMessage; this is the immutable source.
+model ExternalMessage {
+  id          String           @id @default(cuid())
+  channelId   String?
+  channelType ChannelType
+  direction   MessageDirection
+  /// Provider message id. Unique per channel type -> the dedup gate for
+  /// at-least-once webhook delivery and IMAP re-reads.
+  externalId  String
+  /// Provider conversation/thread id where one exists.
+  conversationId String?
+  /// RFC 5322 headers used for email threading.
+  messageIdHeader String?
+  inReplyTo   String?
+  references  String?
+  fromAddress String?
+  toAddress   String?
+  subject     String?
+  bodyText    String?
+  /// Unsanitised original. NEVER rendered directly; sanitised at render time.
+  bodyHtmlRaw String?
+  rawPayload  Json?
+  receivedAt  DateTime         @default(now()) @db.Timestamptz(6)
+  processedAt DateTime?        @db.Timestamptz(6)
+  processingError String?
+  /// True when the sender could not be resolved to a thread or customer and a
+  /// human must triage it.
+  needsManualReview Boolean    @default(false)
+
+  ticketId         String?
+  ticketMessageId  String?     @unique
+  customerId       String?
+  contactId        String?
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+
+  channel       CommunicationChannel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  ticket        Ticket?               @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  ticketMessage TicketMessage?        @relation(fields: [ticketMessageId], references: [id], onDelete: SetNull)
+  customer      Customer?             @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  contact       CustomerContact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  extractionRuns ExtractionRun[]
+
+  @@unique([channelType, externalId])
+  @@index([conversationId])
+  @@index([messageIdHeader])
+  @@index([needsManualReview])
+  @@index([receivedAt])
+  @@map("external_messages")
+}
+
+/// Idempotency ledger for provider webhooks. The unique (channelType, eventId)
+/// insert is the gate: a duplicate delivery loses the race and is skipped.
+model ProcessedWebhookEvent {
+  id          String             @id @default(cuid())
+  channelId   String?
+  channelType ChannelType
+  eventId     String
+  eventType   String?
+  status      WebhookEventStatus @default(RECEIVED)
+  /// Hash of the raw body, to spot a replay with a mutated payload.
+  payloadHash String?
+  payload     Json?
+  error       String?
+  receivedAt  DateTime           @default(now()) @db.Timestamptz(6)
+  processedAt DateTime?          @db.Timestamptz(6)
+
+  channel CommunicationChannel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+
+  @@unique([channelType, eventId])
+  @@index([status])
+  @@index([receivedAt])
+  @@map("processed_webhook_events")
+}
+
+/// One row per delivery attempt for an outbound message, so retries and
+/// provider errors are auditable rather than lost in logs.
+model OutboundMessageAttempt {
+  id              String         @id @default(cuid())
+  ticketMessageId String
+  channelType     ChannelType
+  attemptNo       Int            @default(1)
+  status          DeliveryStatus @default(PENDING)
+  providerMessageId String?
+  requestPayload  Json?
+  responsePayload Json?
+  errorCode       String?
+  errorMessage    String?
+  attemptedAt     DateTime       @default(now()) @db.Timestamptz(6)
+  completedAt     DateTime?      @db.Timestamptz(6)
+
+  ticketMessage TicketMessage @relation(fields: [ticketMessageId], references: [id], onDelete: Cascade)
+
+  @@unique([ticketMessageId, attemptNo])
+  @@index([status])
+  @@map("outbound_message_attempts")
+}
+
+// =========================== ORDER EXTRACTION ==============================
+
+/// One execution of the extraction pipeline over a single message. Retained for
+/// the correction-rate report and for debugging prompt/model regressions.
+model ExtractionRun {
+  id            String           @id @default(cuid())
+  ticketMessageId String?
+  externalMessageId String?
+  engine        ExtractionEngine
+  provider      String?
+  model         String?
+  promptVersion String?
+  status        ExtractionStatus @default(PENDING_REVIEW)
+  /// Raw model output before validation, for debugging schema failures.
+  rawOutput     Json?
+  /// Zod validation errors when the model returned an unusable shape.
+  validationError String?
+  inputTokens   Int?
+  outputTokens  Int?
+  latencyMs     Int?
+  errorMessage  String?
+  startedAt     DateTime         @default(now()) @db.Timestamptz(6)
+  finishedAt    DateTime?        @db.Timestamptz(6)
+
+  ticketMessage   TicketMessage?   @relation(fields: [ticketMessageId], references: [id], onDelete: SetNull)
+  externalMessage ExternalMessage? @relation(fields: [externalMessageId], references: [id], onDelete: SetNull)
+
+  drafts OrderDraft[]
+
+  @@index([status])
+  @@index([startedAt])
+  @@map("extraction_runs")
+}
+
+/// A proposed order awaiting human review. Inert by construction: it holds no
+/// reservation and creates nothing until an OrderApproval exists.
+model OrderDraft {
+  id              String           @id @default(cuid())
+  number          String           @unique
+  ticketId        String?
+  ticketMessageId String?
+  extractionRunId String?
+  customerId      String?
+  status          ExtractionStatus @default(PENDING_REVIEW)
+  currency        String           @default("IDR")
+  customerReference String?
+  customerNotes   String?
+  requestedDeliveryDate DateTime?  @db.Timestamptz(6)
+  /// Verbatim customer text the draft was derived from (auditability, §8).
+  sourceText      String?
+  /// True when any line needs review; blocks one-click conversion.
+  needsReview     Boolean          @default(true)
+  reviewedAt      DateTime?        @db.Timestamptz(6)
+  reviewedById    String?
+  createdAt       DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @db.Timestamptz(6)
+
+  ticket        Ticket?        @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  ticketMessage TicketMessage? @relation(fields: [ticketMessageId], references: [id], onDelete: SetNull)
+  extractionRun ExtractionRun? @relation(fields: [extractionRunId], references: [id], onDelete: SetNull)
+  customer      Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  items       OrderDraftItem[]
+  corrections ExtractionCorrection[]
+  approvals   OrderApproval[]
+  quotations  Quotation[]
+  salesOrder  SalesOrder?
+
+  @@index([ticketId])
+  @@index([status])
+  @@index([needsReview])
+  @@map("order_drafts")
+}
+
+model OrderDraftItem {
+  id          String  @id @default(cuid())
+  draftId     String
+  /// Exact substring of the customer message this line came from.
+  originalText String
+  /// Null until a human (or a high-confidence exact match) resolves it.
+  productId   String?
+  /// Snapshot of the matched SKU at match time.
+  sku         String?
+  productName String?
+  quantity    Decimal? @db.Decimal(18, 3)
+  unit        String?
+  /// 0..1. Set by the matcher; thresholds in src/server/services/matching.
+  matchConfidence Decimal @default(0) @db.Decimal(5, 4)
+  matchMethod MatchMethod?
+  needsReview Boolean @default(true)
+  reviewNotes String?
+  /// Price/stock snapshot taken from the DB at review time, never from the LLM.
+  unitPriceSnapshot Decimal? @db.Decimal(18, 4)
+  availableQtySnapshot Decimal? @db.Decimal(18, 3)
+  sortOrder   Int     @default(0)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime @updatedAt @db.Timestamptz(6)
+
+  draft   OrderDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  product Product?   @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  candidates ProductMatchCandidate[]
+
+  @@index([draftId])
+  @@index([productId])
+  @@map("order_draft_items")
+}
+
+/// Ranked alternatives offered to the reviewer for an ambiguous line. Keeping
+/// the rejected candidates is what makes the match auditable.
+model ProductMatchCandidate {
+  id         String      @id @default(cuid())
+  draftItemId String
+  productId  String
+  score      Decimal     @db.Decimal(5, 4)
+  method     MatchMethod
+  /// Why this candidate was proposed, shown in the review UI.
+  rationale  String?
+  rank       Int         @default(0)
+  createdAt  DateTime    @default(now()) @db.Timestamptz(6)
+
+  draftItem OrderDraftItem @relation(fields: [draftItemId], references: [id], onDelete: Cascade)
+  product   Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([draftItemId, productId])
+  @@index([draftItemId, rank])
+  @@map("product_match_candidates")
+}
+
+/// Audit of every human edit to an extracted draft. Powers the
+/// "order extraction correction rate" report (§14).
+model ExtractionCorrection {
+  id         String   @id @default(cuid())
+  draftId    String
+  draftItemId String?
+  field      String
+  oldValue   String?
+  newValue   String?
+  correctedById String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  draft       OrderDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  correctedBy User?      @relation(fields: [correctedById], references: [id], onDelete: SetNull)
+
+  @@index([draftId])
+  @@index([createdAt])
+  @@map("extraction_corrections")
+}
+
+/// The explicit human gate required before a draft may become a quotation or a
+/// sales order (§8 critical business rules).
+model OrderApproval {
+  id         String           @id @default(cuid())
+  draftId    String
+  decision   ApprovalDecision
+  approvedById String?
+  notes      String?
+  createdAt  DateTime         @default(now()) @db.Timestamptz(6)
+
+  draft      OrderDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  approvedBy User?      @relation(fields: [approvedById], references: [id], onDelete: SetNull)
+
+  @@index([draftId])
+  @@map("order_approvals")
+}
+
+// =============================== SYSTEM ====================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  /// Preserved even if the user row is later removed.
+  actorEmail String?
+  action     String
+  entityType String
+  entityId   String?
+  /// Changed fields only, as { field: { from, to } }.
+  changes    Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+model AppSetting {
+  key       String   @id
+  value     String?
+  /// Secrets are encrypted at rest and redacted by the settings API.
+  isSecret  Boolean  @default(false)
+  category  String?
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([category])
+  @@map("app_settings")
+}
+
+/// Per-document-kind counter backing configurable numbering (e.g.
+/// "SO-{YYYY}{MM}-{SEQ:5}"). Allocation uses an atomic UPDATE..RETURNING so two
+/// concurrent requests can never receive the same number.
+model NumberSequence {
+  id         String       @id @default(cuid())
+  kind       DocumentKind
+  /// Period bucket the counter resets on, e.g. "2026-10" or "ALL".
+  periodKey  String
+  prefix     String?
+  pattern    String       @default("{PREFIX}-{YYYY}{MM}-{SEQ:5}")
+  nextValue  Int          @default(1)
+  padding    Int          @default(5)
+  updatedAt  DateTime     @updatedAt @db.Timestamptz(6)
+
+  @@unique([kind, periodKey])
+  @@map("number_sequences")
+}
+
+/// Metadata for a blob held by the configured storage provider (local volume or
+/// S3-compatible). Rows are never hard-deleted while a ticket references them.
+model StoredFile {
+  id          String   @id @default(cuid())
+  /// Provider key/path. Randomised, never the user-supplied filename.
+  storageKey  String   @unique
+  provider    String   @default("local")
+  filename    String
+  contentType String
+  sizeBytes   Int
+  /// SHA-256 of the content, for dedup and integrity checks.
+  checksum    String?
+  uploadedById String?
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  ticketAttachments TicketAttachment[]
+  userAvatars       User[]             @relation("UserAvatar")
+
+  @@index([checksum])
+  @@map("stored_files")
+}
+
+/// Operational mirror of the pg-boss queue for the admin UI. pg-boss owns its
+/// own tables in a separate schema; this is a denormalised view for humans.
+model BackgroundJobRecord {
+  id         String   @id @default(cuid())
+  jobId      String?  @unique
+  queue      String
+  state      JobState @default(CREATED)
+  payload    Json?
+  attemptCount Int    @default(0)
+  lastError  String?
+  scheduledAt DateTime? @db.Timestamptz(6)
+  startedAt  DateTime? @db.Timestamptz(6)
+  completedAt DateTime? @db.Timestamptz(6)
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([queue, state])
+  @@index([createdAt])
+  @@map("background_job_records")
+}

@@ -1,0 +1,134 @@
+# =============================================================================
+# Automotive Spare Parts ERP — Docker Compose
+#
+#   docker compose up -d --build
+#
+# Services:
+#   postgres   PostgreSQL 17 with a named volume (NOT published to the host)
+#   migrate    runs `prisma migrate deploy`, then exits
+#   web        Next.js server
+#   worker     pg-boss background worker (IMAP polling, dispatch, retries)
+#
+# All secrets come from .env. Copy .env.example and fill it in first.
+# =============================================================================
+
+name: sparepart-erp
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-erp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-sparepart_erp}
+      # Deterministic collation so index ordering cannot shift under us.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --lc-collate=C --lc-ctype=C'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Deliberately NOT published: the database is reachable only on the
+    # internal network. Uncomment only for local debugging, bound to
+    # localhost, never 0.0.0.0.
+    # ports:
+    #   - '127.0.0.1:5432:5432'
+    healthcheck:
+      test:
+        ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-erp} -d ${POSTGRES_DB:-sparepart_erp}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [internal]
+
+  # Runs migrations to completion before web/worker start, so two replicas
+  # never race to apply the same migration.
+  migrate:
+    build:
+      context: .
+      # Dedicated stage: the Prisma CLI is a dev dependency and is deliberately
+      # absent from the serving image.
+      target: migrator
+    restart: 'no'
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  web:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
+      # The worker runs as its own service, so the web replicas must not also
+      # claim jobs.
+      JOB_WORKER_ENABLED: 'false'
+    volumes:
+      - attachments:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Behind a reverse proxy (Coolify/Traefik/Caddy) this port need not be
+    # published; the proxy joins the `web` network instead.
+    ports:
+      - '${WEB_PORT:-3000}:3000'
+    healthcheck:
+      test:
+        ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks: [internal, web]
+
+  worker:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    command: ['node_modules/.bin/tsx', 'src/server/jobs/worker.ts']
+    env_file: [.env]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-erp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sparepart_erp}?schema=public
+      JOB_WORKER_ENABLED: 'true'
+    volumes:
+      # Shares attachment storage with web so inbound email attachments are
+      # readable by the UI.
+      - attachments:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The worker exposes no port; liveness is "the process is up and can
+      # reach the database".
+      test: ['CMD', 'node', '-e', "process.exit(0)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    networks: [internal]
+
+volumes:
+  postgres-data:
+    driver: local
+  attachments:
+    driver: local
+
+networks:
+  # No external access: postgres and the worker live here only.
+  internal:
+    driver: bridge
+  # Reverse proxies attach here to reach `web`.
+  web:
+    driver: bridge
